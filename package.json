@@ -1,0 +1,44 @@
+{
+  "name": "fortis-share",
+  "version": "1.0.0",
+  "description": "AirDrop for Linux → Android: send files, screenshots and clipboard to your phone over Tailscale, with a one-time QR fallback for any device.",
+  "bin": {
+    "share": "bin/share",
+    "share-gui": "bin/share-gui"
+  },
+  "files": [
+    "bin/",
+    "desktop/",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "share",
+    "airdrop",
+    "android",
+    "termux",
+    "tailscale",
+    "qr",
+    "clipboard",
+    "screenshot",
+    "kde",
+    "dolphin",
+    "cli"
+  ],
+  "author": "Ganesh Angadi (https://github.com/ganeshak11)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fortis-Tools/fortis-share.git"
+  },
+  "homepage": "https://github.com/Fortis-Tools/fortis-share#readme",
+  "bugs": {
+    "url": "https://github.com/Fortis-Tools/fortis-share/issues"
+  }
+}

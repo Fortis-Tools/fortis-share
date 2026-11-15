@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Send clipboard to phone
+GenericName=Share
+Comment=Send the clipboard (screenshot, copied files or text) to your phone
+Icon=smartphone
+Exec=@SHARE_GUI@ --clip
+Terminal=false
+Categories=Utility;
+Keywords=share;phone;clipboard;screenshot;send;
+Actions=shot;
+
+[Desktop Action shot]
+Name=Send latest screenshot to phone
+Icon=camera-photo
+Exec=@SHARE_GUI@ --shot

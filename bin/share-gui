@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+SHARE-GUI :: the no-terminal version of `share` (Dolphin → right-click → Send to phone)
+
+  share-gui <path> [path...]
+  share-gui --clip        send the clipboard (screenshot image, copied files, or text)
+  share-gui --shot        send the latest screenshot
+
+Same engine as `share`: your phone over Tailscale + Termux sshd, QR fallback.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication, QHBoxLayout, QLabel, QProgressBar, QPushButton,
+    QStackedWidget, QVBoxLayout, QWidget,
+)
+
+# Load the engine from ~/.local/bin/share (no .py extension, so load it by path).
+_loader = importlib.machinery.SourceFileLoader(
+    "share_engine", os.path.join(os.path.dirname(os.path.realpath(__file__)), "share"))
+_spec = importlib.util.spec_from_loader("share_engine", _loader)
+share = importlib.util.module_from_spec(_spec)
+_loader.exec_module(share)
+
+
+class Worker(QThread):
+    """Runs the slow bits (phone check, rsync, zipping) off the UI thread."""
+    status = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    sent = pyqtSignal()                 # direct transfer finished
+    fallback = pyqtSignal(str)          # reason; switch to QR
+    qr_ready = pyqtSignal(object)       # QRServer
+    failed = pyqtSignal(str)
+
+    def __init__(self, mode, paths, conf, text=None):
+        super().__init__()
+        self.mode, self.paths, self.conf, self.text = mode, paths, conf, text
+
+    def run(self):
+        try:
+            if self.mode == "phone" and self.text is not None:
+                self.status.emit(f"Checking {self.conf['phone_name']}…")
+                up, why = share.phone_reachable(self.conf)
+                if not up:
+                    self.fallback.emit(why)
+                    return
+                self.status.emit("Copying to the phone's clipboard…")
+                if share.send_text_to_phone(self.text, self.conf):
+                    self.sent.emit()
+                else:
+                    self.fallback.emit("phone clipboard failed (is the Termux:API app installed?)")
+            elif self.mode == "phone":
+                self.status.emit(f"Checking {self.conf['phone_name']}…")
+                up, why = share.phone_reachable(self.conf)
+                if not up:
+                    self.fallback.emit(why)
+                    return
+                self.status.emit(f"Sending to {self.conf['phone_name']}…")
+                if share.send_to_phone(self.paths, self.conf, on_progress=self.progress.emit):
+                    self.sent.emit()
+                else:
+                    self.fallback.emit("direct transfer failed")
+            else:
+                if len(self.paths) > 1 or os.path.isdir(self.paths[0]):
+                    self.status.emit("Zipping…")
+                self.qr_ready.emit(share.QRServer(self.paths, self.conf))
+        except Exception as e:  # never leave the window hanging
+            if self.mode == "phone":
+                self.fallback.emit(str(e))
+            else:
+                self.failed.emit(str(e))
+
+
+class ShareWindow(QWidget):
+    def __init__(self, paths=None, text=None, tmpdirs=None):
+        super().__init__()
+        self.paths = paths or []
+        self.text = text
+        self.tmpdirs = list(tmpdirs or [])  # removed when the window closes
+        self.conf = share.load_conf()
+        if text is not None:
+            first = text.strip().splitlines()[0][:40] if text.strip() else ""
+            self.label = "Clipboard text"
+            self.size_txt = f"{len(text)} chars · “{first}”"
+        else:
+            self.label = share.label_for(self.paths)
+            self.size_txt = share.human(share.total_size(self.paths))
+        self.srv = None
+        self.worker = None
+
+        self.setWindowTitle("Send to phone")
+        self.setWindowIcon(QIcon.fromTheme("smartphone"))
+        self.setMinimumWidth(420)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._picker_page())   # 0
+        self.stack.addWidget(self._busy_page())     # 1
+        self.stack.addWidget(self._qr_page())       # 2
+        root = QVBoxLayout(self)
+        root.addWidget(self.stack)
+
+        QShortcut(QKeySequence("Escape"), self, activated=self.close)
+
+    # ── Pages ────────────────────────────────────────────────────────────────
+    def _header(self):
+        title = QLabel(f"<b>{self.label}</b>")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        title.setWordWrap(True)
+        size = QLabel(self.size_txt)
+        size.setStyleSheet("color: palette(placeholder-text);")
+        box = QVBoxLayout()
+        box.addWidget(title)
+        box.addWidget(size)
+        return box
+
+    def _big_button(self, icon, text, sub):
+        b = QPushButton(QIcon.fromTheme(icon), f"  {text}\n  {sub}")
+        b.setIconSize(b.iconSize() * 2)
+        b.setMinimumHeight(64)
+        b.setStyleSheet("text-align: left; padding: 8px;")
+        return b
+
+    def _picker_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addLayout(self._header())
+        v.addSpacing(8)
+        v.addWidget(QLabel("Who is receiving?"))
+        if share.phone_configured(self.conf):
+            phone = self._big_button("smartphone", self.conf["phone_name"], "Direct over Tailscale, QR if offline")
+        else:
+            phone = self._big_button("smartphone", "No phone set up", "Run `share --setup` once in a terminal")
+            phone.setEnabled(False)
+        other = self._big_button("view-barcode-qr", "Other device", "QR code, same Wi-Fi")
+        phone.clicked.connect(lambda: self.start("phone"))
+        other.clicked.connect(lambda: self.start("qr"))
+        default = phone if phone.isEnabled() else other
+        default.setDefault(True)
+        default.setFocus()
+        v.addWidget(phone)
+        v.addWidget(other)
+        return page
+
+    def _busy_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addLayout(self._header())
+        v.addSpacing(8)
+        self.busy_status = QLabel()
+        self.busy_status.setWordWrap(True)
+        self.busy_bar = QProgressBar()
+        v.addWidget(self.busy_status)
+        v.addWidget(self.busy_bar)
+        v.addStretch()
+        cancel = QPushButton(QIcon.fromTheme("dialog-cancel"), "Cancel")
+        cancel.clicked.connect(self.close)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(cancel)
+        v.addLayout(row)
+        return page
+
+    def _qr_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        self.qr_note = QLabel()
+        self.qr_note.setWordWrap(True)
+        self.qr_note.setStyleSheet("color: #d97706;")
+        self.qr_note.hide()
+        v.addWidget(self.qr_note)
+        self.qr_img = QLabel()
+        self.qr_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_img.setStyleSheet("background: white; border-radius: 8px; padding: 6px;")
+        v.addWidget(self.qr_img)
+        self.qr_name = QLabel()
+        self.qr_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.qr_name)
+        self.qr_url = QLabel()
+        self.qr_url.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.qr_url.setStyleSheet("color: palette(link);")
+        v.addWidget(self.qr_url)
+        self.qr_status = QLabel("Scan with a device on the same Wi-Fi")
+        self.qr_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.qr_status)
+        self.qr_bar = QProgressBar()
+        self.qr_bar.hide()
+        v.addWidget(self.qr_bar)
+        self.fw_hint = QLabel()
+        self.fw_hint.setWordWrap(True)
+        self.fw_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.fw_hint.setStyleSheet("color: palette(placeholder-text); font-size: 9pt;")
+        self.fw_hint.hide()
+        v.addWidget(self.fw_hint)
+        row = QHBoxLayout()
+        self.copy_btn = QPushButton(QIcon.fromTheme("edit-copy"), "Copy link")
+        self.copy_btn.clicked.connect(lambda: (QGuiApplication.clipboard().setText(self.srv.url),
+                                               self.qr_status.setText("Link copied")))
+        self.cancel_btn = QPushButton(QIcon.fromTheme("dialog-cancel"), "Cancel")
+        self.cancel_btn.clicked.connect(self.close)
+        row.addWidget(self.copy_btn)
+        row.addStretch()
+        row.addWidget(self.cancel_btn)
+        v.addLayout(row)
+        return page
+
+    # ── Flow ─────────────────────────────────────────────────────────────────
+    def start(self, mode):
+        if mode == "qr" and self.text is not None:
+            if len(self.text.encode()) <= share.TEXT_QR_LIMIT:
+                return self.show_text_qr()
+            # Long text: send it as a .txt file through the QR server.
+            path, tmpdir = share.text_to_file(self.text)
+            self.tmpdirs.append(tmpdir)
+            self.paths, self.text = [path], None
+        self.busy_bar.setRange(0, 0)  # indeterminate until rsync reports %
+        self.stack.setCurrentIndex(1)
+        self.worker = Worker(mode, self.paths, self.conf, text=self.text)
+        self.worker.status.connect(self.busy_status.setText)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.sent.connect(self.on_sent)
+        self.worker.fallback.connect(self.on_fallback)
+        self.worker.qr_ready.connect(self.on_qr_ready)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    def on_progress(self, pct):
+        self.busy_bar.setRange(0, 100)
+        self.busy_bar.setValue(pct)
+
+    def on_sent(self):
+        self.busy_bar.setRange(0, 100)
+        self.busy_bar.setValue(100)
+        if self.text is not None:
+            self.busy_status.setText(f"✔ On {self.conf['phone_name']}'s clipboard, paste anywhere")
+        else:
+            self.busy_status.setText(f"✔ Delivered to {self.conf['dest']}")
+        share.notify("Sent to phone", f"{self.label} → {self.conf['phone_name']}")
+        QTimer.singleShot(1200, self.close)
+
+    def show_text_qr(self):
+        """Short text lives inside the QR itself: no server needed."""
+        pix = QPixmap()
+        pix.loadFromData(share.qr_png(self.text, scale=6))
+        self.qr_img.setPixmap(pix)
+        self.qr_name.setText(f"<b>Clipboard text</b>  ·  {len(self.text)} chars")
+        self.qr_url.hide()
+        self.qr_status.setText("Scan to get the text")
+        self.copy_btn.hide()
+        self.cancel_btn.setText("Done")
+        self.cancel_btn.setIcon(QIcon.fromTheme("dialog-ok"))
+        self.stack.setCurrentIndex(2)
+        self.adjustSize()
+
+    def on_fallback(self, reason):
+        self.qr_note.setText(f"Couldn't reach {self.conf['phone_name']}: {reason}.\nScan this instead:")
+        self.qr_note.show()
+        self.start("qr")
+
+    def on_failed(self, msg):
+        self.busy_bar.setRange(0, 1)
+        self.busy_status.setText(f"✖ {msg}")
+
+    def on_qr_ready(self, srv):
+        self.srv = srv
+        pix = QPixmap()
+        pix.loadFromData(share.qr_png(srv.url, scale=7))
+        self.qr_img.setPixmap(pix)
+        self.qr_name.setText(f"<b>{srv.name}</b>  ·  {share.human(srv.size)}")
+        self.qr_url.setText(srv.url)
+        if share.ufw_active():
+            self.fw_hint.setText(
+                "Firewall is on. If the device can't open the link, allow it once in a terminal:\n"
+                f"sudo ufw allow from {share.lan_subnet()} to any port {srv.port} proto tcp")
+            self.fw_hint.show()
+        self.stack.setCurrentIndex(2)
+        self.adjustSize()
+        self.timer = QTimer(self, interval=300, timeout=self.poll_qr)
+        self.timer.start()
+
+    def poll_qr(self):
+        st = self.srv.status()
+        if st == "downloading":
+            self.qr_bar.show()
+            self.qr_bar.setValue(self.srv.percent)
+            self.qr_status.setText("Downloading…")
+        elif st == "done":
+            self.timer.stop()
+            self.qr_bar.setValue(100)
+            self.qr_status.setText("✔ Downloaded")
+            share.notify("Sent", f"{self.srv.name} was downloaded")
+            QTimer.singleShot(1200, self.close)
+        elif st == "timeout":
+            self.timer.stop()
+            self.qr_status.setText("Timed out, nobody downloaded it")
+
+    def closeEvent(self, e):
+        if self.srv:
+            self.srv.stop()
+            self.srv = None
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(1000)
+        for d in self.tmpdirs:
+            share.shutil.rmtree(d, ignore_errors=True)
+        e.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("share")
+    app.setDesktopFileName("share-gui")
+    args = sys.argv[1:]
+
+    if "--clip" in args:
+        try:
+            kind, payload, tmpdir = share.read_clipboard()
+        except RuntimeError as e:
+            share.notify("Send to phone", f"Clipboard: {e}")
+            return 1
+        w = (ShareWindow(text=payload) if kind == "text"
+             else ShareWindow(paths=payload, tmpdirs=[tmpdir] if tmpdir else []))
+    elif "--shot" in args:
+        shot = share.latest_screenshot()
+        if not shot:
+            share.notify("Send to phone", "No screenshots found in ~/Pictures/Screenshots")
+            return 1
+        w = ShareWindow(paths=[shot])
+    else:
+        paths = [p for p in args if os.path.exists(p)]
+        if not paths:
+            share.notify("Send to phone", "Nothing to send")
+            return 1
+        w = ShareWindow(paths=paths)
+    w.show()
+    w.raise_()
+    w.activateWindow()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

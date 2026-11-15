@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""
+SHARE :: send files from this laptop to your phone or any device   (fortis-share)
+
+  share <path> [path...]        ask who receives, then send
+  share -c | --clip             send the clipboard: screenshot image, copied files, or text
+  share -s | --shot             send the latest screenshot from ~/Pictures/Screenshots
+  share -t phone <path>         straight to your phone (falls back to QR)
+  share -t qr <path>            straight to QR (any device on the same Wi-Fi)
+
+  share --setup                 set up your phone (Tailscale + Termux sshd)
+  share --check                 is the phone reachable right now?
+  share --dest [folder]         show or set the folder on the phone
+  share --install-desktop       add "Send to phone" to Dolphin + a clipboard launcher
+  share --uninstall-desktop     remove them
+  share --doctor                check dependencies
+  share --version
+
+Phone path: Tailscale + Termux sshd, files land in a folder on the phone.
+QR path: a one-time HTTP server with a secret link; stops after the download.
+GUI version: share-gui (Dolphin → right-click → Send to phone).
+"""
+
+__version__ = "1.0.0"
+
+import argparse
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import zipfile
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+C = {
+    "r": "\033[0m", "b": "\033[1m", "dim": "\033[2m",
+    "red": "\033[91m", "grn": "\033[92m", "yel": "\033[93m",
+    "blu": "\033[94m", "mag": "\033[95m", "cyn": "\033[96m",
+}
+def c(color, text): return f"{C[color]}{text}{C['r']}"
+def info(msg): print(f"  {c('cyn', '›')} {msg}")
+def ok(msg):   print(f"  {c('grn', '✔')} {msg}")
+def warn(msg): print(f"  {c('yel', '⚠')} {msg}")
+def err(msg):  print(f"  {c('red', '✖')} {msg}")
+
+# ── Config ───────────────────────────────────────────────────────────────────
+CONF_DIR = os.path.expanduser("~/.config/fortis-share")
+CONF_FILE = os.path.join(CONF_DIR, "config.json")
+
+DEFAULTS = {
+    "phone_name": "",
+    "phone_ip": "",             # Tailscale IP of the phone; empty = no phone set up (QR only)
+    "phone_port": "8022",       # Termux sshd
+    "ssh_key": "~/.ssh/id_ed25519",
+    "known_hosts": "~/.ssh/known_hosts",
+    "dest": "/sdcard/Download/Share",
+    "qr_port": 8765,
+    "qr_timeout_min": 10,
+    "fortis_backup_conf": "",   # optional: follow MOBILE_IP / MOBILE_PORT from fortis-backup's backup.conf
+}
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        with open(CONF_FILE) as f:
+            conf.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    # Fortis users: stay in sync with fortis-backup, so a new phone IP is picked up automatically.
+    if conf.get("fortis_backup_conf"):
+        try:
+            with open(os.path.expanduser(conf["fortis_backup_conf"])) as f:
+                for line in f:
+                    m = re.match(r'^\s*(MOBILE_IP|MOBILE_PORT)\s*=\s*"?([^"#\s]+)"?', line)
+                    if m:
+                        conf["phone_ip" if m.group(1) == "MOBILE_IP" else "phone_port"] = m.group(2)
+        except OSError:
+            pass
+    if not conf["phone_name"]:
+        conf["phone_name"] = "Phone"
+    return conf
+
+def phone_configured(conf):
+    return bool(conf.get("phone_ip"))
+
+def save_conf(updates):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    current = {}
+    try:
+        with open(CONF_FILE) as f:
+            current = json.load(f)
+    except (OSError, ValueError):
+        pass
+    current.update(updates)
+    with open(CONF_FILE, "w") as f:
+        json.dump(current, f, indent=2)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+def total_size(paths):
+    size = 0
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _, files in os.walk(p):
+                for fn in files:
+                    try:
+                        size += os.path.getsize(os.path.join(root, fn))
+                    except OSError:
+                        pass
+        else:
+            size += os.path.getsize(p)
+    return size
+
+def label_for(paths):
+    return os.path.basename(os.path.abspath(paths[0]).rstrip("/")) if len(paths) == 1 else f"{len(paths)} items"
+
+# ── Sources: latest screenshot, clipboard ────────────────────────────────────
+# (folder, only files whose name starts with this; "" = any image)
+SCREENSHOT_DIRS = [("~/Pictures/Screenshots", ""), ("~/Pictures", "screenshot")]
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp")
+TEXT_QR_LIMIT = 1200  # longer text goes out as a .txt file instead of inside the QR
+
+def latest_screenshot():
+    best = None
+    for d, prefix in SCREENSHOT_DIRS:
+        try:
+            entries = list(os.scandir(os.path.expanduser(d)))
+        except OSError:
+            continue
+        for e in entries:
+            name = e.name.lower()
+            if e.is_file() and name.endswith(IMAGE_EXT) and name.startswith(prefix):
+                mtime = e.stat().st_mtime
+                if best is None or mtime > best[0]:
+                    best = (mtime, e.path)
+    return best[1] if best else None
+
+def read_clipboard():
+    """
+    What's on the clipboard, as one of:
+      ("files", [paths], tmpdir)  files copied in Dolphin, or an image (Spectacle copies screenshots)
+      ("text",  str,     None)    plain text
+    tmpdir (if any) must be removed by the caller. Raises RuntimeError.
+    """
+    if not shutil.which("wl-paste"):
+        raise RuntimeError("wl-paste not installed (sudo apt install wl-clipboard)")
+    types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True).stdout.split()
+    if not types:
+        raise RuntimeError("the clipboard is empty")
+
+    if "text/uri-list" in types:
+        uris = subprocess.run(["wl-paste", "--type", "text/uri-list"], capture_output=True, text=True).stdout
+        paths = [urllib.parse.unquote(urllib.parse.urlparse(u.strip()).path)
+                 for u in uris.splitlines() if u.strip().startswith("file://")]
+        paths = [p for p in paths if os.path.exists(p)]
+        if paths:
+            return "files", paths, None
+
+    img = next((t for t in ("image/png", "image/jpeg", "image/webp") if t in types), None)
+    if img:
+        data = subprocess.run(["wl-paste", "--type", img], capture_output=True).stdout
+        if data:
+            tmpdir = tempfile.mkdtemp(prefix="share-")
+            ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[img]
+            path = os.path.join(tmpdir, f"Screenshot_{time.strftime('%Y%m%d_%H%M%S')}.{ext}")
+            with open(path, "wb") as f:
+                f.write(data)
+            return "files", [path], tmpdir
+
+    text = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True).stdout
+    if text.strip():
+        return "text", text, None
+    raise RuntimeError("nothing on the clipboard that can be sent")
+
+def text_to_file(text):
+    """Long text is sent as a .txt file. Returns (path, tmpdir)."""
+    tmpdir = tempfile.mkdtemp(prefix="share-")
+    path = os.path.join(tmpdir, f"clipboard_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+    with open(path, "w") as f:
+        f.write(text)
+    return path, tmpdir
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "share", "-i", "smartphone", title, body],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def ufw_active():
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "ufw"]).returncode == 0
+    except OSError:
+        return False
+
+def ssh_base(conf):
+    return [
+        "ssh", "-p", str(conf["phone_port"]),
+        "-i", os.path.expanduser(conf["ssh_key"]),
+        "-o", f"UserKnownHostsFile={os.path.expanduser(conf['known_hosts'])}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+    ]
+
+# ── Phone (Tailscale + Termux sshd) ─────────────────────────────────────────
+def phone_reachable(conf):
+    """Returns (True, None) or (False, reason)."""
+    if not phone_configured(conf):
+        return False, "no phone set up yet (run: share --setup)"
+    ip, port = conf["phone_ip"], int(conf["phone_port"])
+
+    # 1. Tailscale: is the phone online at all?
+    if shutil.which("tailscale"):
+        try:
+            out = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            peers = json.loads(out).get("Peer", {}) or {}
+            for peer in peers.values():
+                if ip in (peer.get("TailscaleIPs") or []):
+                    if not peer.get("Online"):
+                        return False, "phone is offline on Tailscale (open the Tailscale app)"
+                    break
+        except (subprocess.SubprocessError, ValueError, OSError):
+            pass  # tailscale CLI hiccup: fall through to the port check
+
+    # 2. Termux sshd: is the port open?
+    try:
+        with socket.create_connection((ip, port), timeout=3):
+            pass
+    except OSError:
+        return False, conf.get("sshd_hint") or "Termux sshd isn't running on the phone (open Termux and run: sshd)"
+
+    # 3. Auth: does the Fortis key still work?
+    try:
+        r = subprocess.run(ssh_base(conf) + [ip, "true"], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return False, "ssh login timed out"
+    if r.returncode != 0:
+        why = (r.stderr.strip().splitlines() or ["unknown ssh error"])[-1]
+        return False, f"ssh login failed: {why}"
+    return True, None
+
+def send_to_phone(paths, conf, on_progress=None):
+    """rsync to the phone. on_progress(pct) is called while sending (GUI); otherwise rsync prints."""
+    ip, dest = conf["phone_ip"], conf["dest"].rstrip("/")
+    ssh = ssh_base(conf)
+
+    subprocess.run(ssh + [ip, f"mkdir -p '{dest}'"], check=True, timeout=15,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    cmd = [
+        "rsync", "-rlt", "--partial", "--info=progress2", "--protect-args",
+        "-e", " ".join(ssh),
+        *[os.path.abspath(p).rstrip("/") for p in paths],
+        f"{ip}:{dest}/",
+    ]
+    if on_progress is None:
+        rc = subprocess.run(cmd).returncode
+    else:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        buf = b""
+        while chunk := proc.stdout.read(256):
+            buf += chunk
+            *lines, buf = re.split(rb"[\r\n]", buf)
+            for line in lines:
+                m = re.search(rb"(\d+)%", line)
+                if m:
+                    on_progress(int(m.group(1)))
+        rc = proc.wait()
+    if rc != 0:
+        return False
+
+    # Best effort: make the files show up in Gallery/Files and ping the phone.
+    names = [os.path.basename(os.path.abspath(p).rstrip("/")) for p in paths]
+    remote_paths = " ".join(f"'{dest}/{n}'" for n in names)
+    subprocess.run(
+        ssh + [ip, f"command -v termux-media-scan >/dev/null && termux-media-scan -r {remote_paths} >/dev/null 2>&1; "
+                   f"command -v termux-notification >/dev/null && termux-notification "
+                   f"--title 'Received from laptop' --content '{label_for(paths)} → {dest}' >/dev/null 2>&1; true"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+    )
+    return True
+
+def send_text_to_phone(text, conf):
+    """Put text on the phone's clipboard (needs the Termux:API app). Returns True on success."""
+    remote = ("command -v termux-clipboard-set >/dev/null || exit 3; termux-clipboard-set || exit 4; "
+              "termux-notification --title 'Clipboard from laptop' "
+              "--content 'Copied to your clipboard, paste anywhere' >/dev/null 2>&1; exit 0")
+    try:
+        r = subprocess.run(ssh_base(conf) + [conf["phone_ip"], remote], input=text.encode(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except subprocess.TimeoutExpired:
+        return False
+    return r.returncode == 0
+
+# ── QR (one-time HTTP server) ────────────────────────────────────────────────
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # no packet is sent; just picks the outgoing interface
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+def lan_subnet():
+    """The real subnet of the Wi-Fi interface, e.g. 10.15.151.0/24 (for the ufw hint)."""
+    ip = lan_ip()
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            cidr = line.split()[3]
+            if cidr.split("/")[0] == ip:
+                return str(ipaddress.ip_interface(cidr).network)
+    except (OSError, IndexError, ValueError):
+        pass
+    return f"{ip.rsplit('.', 1)[0]}.0/24"
+
+def prepare_payload(paths):
+    """A single file is served as-is; folders or several files become one zip."""
+    if len(paths) == 1 and os.path.isfile(paths[0]):
+        return os.path.abspath(paths[0]), None
+    tmpdir = tempfile.mkdtemp(prefix="share-")
+    base = (os.path.basename(os.path.abspath(paths[0]).rstrip("/"))
+            if len(paths) == 1 else f"share-{time.strftime('%Y%m%d-%H%M')}")
+    zpath = os.path.join(tmpdir, f"{base}.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in paths:
+            p = os.path.abspath(p).rstrip("/")
+            parent = os.path.dirname(p)
+            if os.path.isdir(p):
+                for root, _, files in os.walk(p):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        z.write(full, os.path.relpath(full, parent))
+            else:
+                z.write(p, os.path.basename(p))
+    return zpath, tmpdir
+
+class QRServer:
+    """One-time download server. Used by both the CLI and share-gui."""
+
+    GRACE = 5  # seconds to stay up after a full download (some phone browsers re-request)
+
+    def __init__(self, paths, conf):
+        self.file_path, self.tmpdir = prepare_payload(paths)
+        self.name = os.path.basename(self.file_path)
+        self.size = os.path.getsize(self.file_path)
+        self.deadline = time.time() + conf["qr_timeout_min"] * 60
+        token = secrets.token_urlsafe(9)
+        self.url_path = f"/{token}/{urllib.parse.quote(self.name)}"
+        self.sent = 0
+        self._active = 0
+        self._done_at = None
+        self._lock = threading.Lock()
+        srv = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _headers(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(srv.size))
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename*=UTF-8''{urllib.parse.quote(srv.name)}")
+                self.end_headers()
+
+            def do_HEAD(self):
+                if self.path != srv.url_path:
+                    return self.send_error(404)
+                self._headers()
+
+            def do_GET(self):
+                if self.path != srv.url_path:
+                    return self.send_error(404)  # anyone without the secret link gets nothing
+                with srv._lock:
+                    srv._active += 1
+                    srv._done_at = None
+                sent = 0
+                try:
+                    self._headers()
+                    with open(srv.file_path, "rb") as f:
+                        while chunk := f.read(256 * 1024):
+                            self.wfile.write(chunk)
+                            sent += len(chunk)
+                            srv.sent = max(srv.sent, sent)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    with srv._lock:
+                        srv._active -= 1
+                        if sent == srv.size and srv._active == 0:
+                            srv._done_at = time.time()
+
+        try:
+            self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", int(conf["qr_port"])), Handler)
+        except OSError:
+            self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.url = f"http://{lan_ip()}:{self.port}{self.url_path}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def percent(self):
+        return self.sent * 100 // max(self.size, 1)
+
+    def status(self):
+        """'waiting' | 'downloading' | 'done' | 'timeout'"""
+        if self._done_at and self._active == 0 and time.time() - self._done_at > self.GRACE:
+            return "done"
+        if time.time() >= self.deadline:
+            return "timeout"
+        return "downloading" if self.sent else "waiting"
+
+    def stop(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        finally:
+            if self.tmpdir:
+                shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+def qr_png(url, scale=8):
+    """QR code as PNG bytes, generated locally (the link never goes to an online QR service)."""
+    return subprocess.run(["qrencode", "-t", "PNG", "-s", str(scale), "-m", "2", "-o", "-", url],
+                          capture_output=True, check=True).stdout
+
+def serve_qr(paths, conf):
+    if len(paths) > 1 or os.path.isdir(paths[0]):
+        info("Zipping…")
+    srv = QRServer(paths, conf)
+    print()
+    if shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2", srv.url])
+    else:
+        warn("qrencode not installed (sudo apt install qrencode); open the link manually")
+    print(f"  {c('b', srv.name)}  {c('dim', human(srv.size))}")
+    print(f"  {c('blu', srv.url)}")
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", srv.url], stderr=subprocess.DEVNULL)
+        print(f"  {c('dim', 'link copied to clipboard')}")
+    print(f"  {c('dim', 'Scan from a device on the same Wi-Fi. Stops after the download, or in')} "
+          f"{c('dim', str(conf['qr_timeout_min']) + ' min. Ctrl+C to cancel.')}")
+    if ufw_active():
+        warn(f"Firewall is on. If the device can't open the link, allow it once:\n"
+             f"      sudo ufw allow from {lan_subnet()} to any port {srv.port} proto tcp")
+
+    last_pct, status = -1, "waiting"
+    try:
+        while status not in ("done", "timeout"):
+            time.sleep(0.3)
+            status = srv.status()
+            if srv.sent and srv.percent != last_pct:
+                last_pct = srv.percent
+                print(f"\r  {c('cyn', '›')} downloading… {last_pct:3d}%  {human(srv.sent)}", end="", flush=True)
+    except KeyboardInterrupt:
+        print()
+        warn("Cancelled")
+    finally:
+        srv.stop()
+    print()
+    if status == "done":
+        ok(f"Downloaded: {srv.name}")
+        notify("share", f"Downloaded: {srv.name}")
+        return True
+    if status == "timeout":
+        warn("Timed out, nobody downloaded it")
+    return False
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+def ask_receiver(conf):
+    if not phone_configured(conf):
+        info(f"No phone set up yet, using QR {c('dim', '(run: share --setup)')}")
+        return "qr"
+    print()
+    print(f"  {c('b', 'Who is receiving?')}")
+    print(f"    {c('mag', '1')}  📱 {conf['phone_name']}  {c('dim', '(direct, falls back to QR)')}")
+    print(f"    {c('mag', '2')}  🌐 Other device  {c('dim', '(QR code, same Wi-Fi)')}")
+    try:
+        choice = input(f"  {c('cyn', '›')} [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    if choice in ("1", "p", "phone"):
+        return "phone"
+    if choice in ("2", "q", "qr", "other"):
+        return "qr"
+    err(f"Unknown choice '{choice}'")
+    sys.exit(2)
+
+# ── Setup wizard ─────────────────────────────────────────────────────────────
+def _ask(prompt, default=""):
+    hint = f" {c('dim', f'[{default}]')}" if default else ""
+    try:
+        return input(f"  {c('cyn', '›')} {prompt}{hint}: ").strip() or default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+
+def _tailscale_peers():
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5).stdout
+        peers = json.loads(out).get("Peer", {}) or {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    rows = []
+    for p in peers.values():
+        ips = [i for i in (p.get("TailscaleIPs") or []) if ":" not in i]
+        if ips:
+            rows.append((p.get("HostName", "?"), ips[0], p.get("OS", ""), bool(p.get("Online"))))
+    rows.sort(key=lambda r: (r[2] != "android", not r[3], r[0]))
+    return rows
+
+def cmd_setup():
+    conf = load_conf()
+    print(f"\n  {c('b', 'fortis-share setup')}  {c('dim', 'phone = Tailscale + Termux sshd')}\n")
+    peers = _tailscale_peers()
+    name_default, ip_default = conf["phone_name"] if phone_configured(conf) else "", conf["phone_ip"]
+    if peers:
+        print(f"  {c('b', 'Your Tailscale devices:')}")
+        for i, (host, ip, os_, online) in enumerate(peers, 1):
+            dot = c("grn", "●") if online else c("dim", "○")
+            print(f"    {c('mag', str(i))}  {dot} {host}  {c('dim', f'{ip} · {os_}')}")
+        pick = _ask("Pick your phone by number, or type its Tailscale IP", "1" if not ip_default else ip_default)
+        if pick.isdigit() and 1 <= int(pick) <= len(peers):
+            host, ip_default = peers[int(pick) - 1][0], peers[int(pick) - 1][1]
+            name_default = name_default or host
+        else:
+            ip_default = pick
+    else:
+        warn("Tailscale not found or not logged in; type the phone's IP")
+        ip_default = _ask("Phone IP", ip_default)
+
+    keys = sorted(p[:-4] for p in os.listdir(os.path.expanduser("~/.ssh")) if p.endswith(".pub")) \
+        if os.path.isdir(os.path.expanduser("~/.ssh")) else []
+    new = {
+        "phone_ip": ip_default,
+        "phone_name": _ask("Phone name", name_default or "Phone"),
+        "phone_port": _ask("Termux sshd port", str(conf["phone_port"])),
+        "ssh_key": _ask(f"SSH key {c('dim', '(' + ', '.join(keys) + ')') if keys else ''}".rstrip(), conf["ssh_key"]),
+        "known_hosts": _ask("known_hosts file", conf["known_hosts"]),
+        "dest": _ask("Folder on the phone", conf["dest"]),
+    }
+    save_conf(new)
+    ok(f"Saved to {CONF_FILE}")
+
+    conf = load_conf()
+    info(f"Testing {conf['phone_name']}…")
+    up, why = phone_reachable(conf)
+    if not up and "Host key verification failed" in (why or ""):
+        if _ask("Phone's host key isn't known yet. Trust it now? (y/N)", "n").lower() == "y":
+            subprocess.run(ssh_base(conf)[:-6] + [
+                "-o", f"UserKnownHostsFile={os.path.expanduser(conf['known_hosts'])}",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5", conf["phone_ip"], "true"])
+            up, why = phone_reachable(conf)
+    if up:
+        ok("Phone reachable, you're ready: share <file>")
+    else:
+        warn(f"Not reachable right now: {why}")
+        info("On the phone: install Termux + Tailscale, run `pkg install openssh rsync termux-api`, "
+             "add your public key to ~/.ssh/authorized_keys, then run `sshd`.")
+    return 0
+
+# ── Desktop integration (Dolphin service menu + launcher) ────────────────────
+HERE = os.path.dirname(os.path.realpath(__file__))
+SERVICE_MENU = os.path.expanduser("~/.local/share/kio/servicemenus/fortis-share.desktop")
+LAUNCHER = os.path.expanduser("~/.local/share/applications/fortis-share-clipboard.desktop")
+
+def cmd_install_desktop():
+    gui = os.path.join(HERE, "share-gui")
+    templates = os.path.join(HERE, "..", "desktop")
+    for src, dst in (("send-to-phone.desktop", SERVICE_MENU), ("share-clipboard.desktop", LAUNCHER)):
+        with open(os.path.join(templates, src)) as f:
+            text = f.read().replace("@SHARE_GUI@", gui)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w") as f:
+            f.write(text)
+        os.chmod(dst, 0o755)  # KDE only runs executable service menus
+        ok(dst)
+    if shutil.which("kbuildsycoca6"):
+        subprocess.run(["kbuildsycoca6"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    info("Dolphin: right-click a file → Send to phone. App launcher: “Send clipboard to phone”.")
+    info("Tip: bind it to a key in System Settings → Keyboard → Shortcuts → Add Application.")
+    return 0
+
+def cmd_uninstall_desktop():
+    for dst in (SERVICE_MENU, LAUNCHER):
+        if os.path.exists(dst):
+            os.remove(dst)
+            ok(f"Removed {dst}")
+    return 0
+
+def cmd_doctor():
+    checks = [
+        ("ssh", "openssh-client", True), ("rsync", "rsync", True), ("qrencode", "qrencode", True),
+        ("wl-paste", "wl-clipboard", False), ("tailscale", "tailscale", False),
+        ("notify-send", "libnotify-bin", False),
+    ]
+    good = True
+    for cmd, pkg, required in checks:
+        if shutil.which(cmd):
+            ok(cmd)
+        else:
+            good = good and not required
+            (err if required else warn)(f"{cmd} missing → sudo apt install {pkg}"
+                                        + ("" if required else c("dim", "  (optional)")))
+    try:
+        import PyQt6  # noqa: F401
+        ok("PyQt6 (for share-gui)")
+    except ImportError:
+        warn(f"PyQt6 missing → sudo apt install python3-pyqt6 {c('dim', '(only for share-gui)')}")
+    conf = load_conf()
+    if phone_configured(conf):
+        up, why = phone_reachable(conf)
+        (ok if up else warn)(f"{conf['phone_name']}: " + ("reachable" if up else why))
+    else:
+        warn("No phone set up → share --setup")
+    return 0 if good else 1
+
+def main():
+    ap = argparse.ArgumentParser(prog="share", add_help=False)
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("-t", "--to", choices=["phone", "qr"])
+    ap.add_argument("--dest", nargs="?", const="")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("-c", "--clip", action="store_true")
+    ap.add_argument("-s", "--shot", action="store_true")
+    ap.add_argument("--setup", action="store_true")
+    ap.add_argument("--install-desktop", action="store_true")
+    ap.add_argument("--uninstall-desktop", action="store_true")
+    ap.add_argument("--doctor", action="store_true")
+    ap.add_argument("--version", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    conf = load_conf()
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with rsync/qrencode output
+
+    if a.version:
+        print(f"fortis-share {__version__}")
+        return 0
+    if a.setup:
+        return cmd_setup()
+    if a.install_desktop:
+        return cmd_install_desktop()
+    if a.uninstall_desktop:
+        return cmd_uninstall_desktop()
+    if a.doctor:
+        return cmd_doctor()
+
+    if a.help or (not a.paths and a.dest is None and not a.check and not a.clip and not a.shot):
+        print(__doc__.strip("\n"))
+        return 0
+
+    if a.dest is not None:
+        if a.dest:
+            save_conf({"dest": a.dest})
+            ok(f"Phone folder set to {c('blu', a.dest)}")
+        else:
+            info(f"Phone folder: {c('blu', conf['dest'])}")
+        return 0
+
+    if a.check:
+        up, why = phone_reachable(conf)
+        (ok if up else err)(f"{conf['phone_name']}: " + ("reachable" if up else why))
+        return 0 if up else 1
+
+    tmpdir = None
+    try:
+        if a.clip:
+            try:
+                kind, payload, tmpdir = read_clipboard()
+            except RuntimeError as e:
+                err(f"Clipboard: {e}")
+                return 1
+            if kind == "text":
+                return send_text_flow(payload, a.to, conf)
+            paths = payload
+        elif a.shot:
+            shot = latest_screenshot()
+            if not shot:
+                err("No screenshots found in ~/Pictures/Screenshots")
+                return 1
+            paths = [shot]
+        else:
+            paths = a.paths
+        return send_files_flow(paths, a.to, conf)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+def send_files_flow(paths, to, conf):
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        for p in missing:
+            err(f"Not found: {p}")
+        return 1
+
+    label = label_for(paths)
+    print(f"\n  📤 {c('b', label)}  {c('dim', human(total_size(paths)))}")
+    target = to or ask_receiver(conf)
+
+    if target == "phone":
+        info(f"Checking {conf['phone_name']}…")
+        up, why = phone_reachable(conf)
+        if up:
+            ok("Phone reachable over Tailscale")
+            info(f"Sending to {c('b', conf['phone_name'])} → {c('blu', conf['dest'])}")
+            if send_to_phone(paths, conf):
+                ok(f"Delivered to {conf['dest']}")
+                notify("share", f"Sent {label} to {conf['phone_name']}")
+                return 0
+            warn("Direct transfer failed, falling back to QR")
+        else:
+            warn(f"Can't reach the phone: {why}")
+            info("Falling back to QR")
+    return 0 if serve_qr(paths, conf) else 1
+
+def send_text_flow(text, to, conf):
+    preview = text.strip().splitlines()[0][:50] if text.strip() else ""
+    print(f"\n  📋 {c('b', 'Clipboard text')}  {c('dim', f'{len(text)} chars · {preview!r}')}")
+    target = to or ask_receiver(conf)
+
+    if target == "phone":
+        info(f"Checking {conf['phone_name']}…")
+        up, why = phone_reachable(conf)
+        if up and send_text_to_phone(text, conf):
+            ok(f"On {conf['phone_name']}'s clipboard, paste anywhere")
+            notify("share", f"Clipboard sent to {conf['phone_name']}")
+            return 0
+        warn(f"Can't reach the phone: {why}" if not up
+             else "Phone clipboard failed (is the Termux:API app installed?)")
+        info("Falling back to QR")
+
+    if len(text.encode()) <= TEXT_QR_LIMIT and shutil.which("qrencode"):
+        # Short text goes inside the QR itself: no server, nothing leaves the screen.
+        print()
+        subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2"], input=text.encode())
+        print(f"  {c('dim', 'Scan to get the text. Press Enter when done.')}")
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            print()
+        return 0
+    path, tmpdir = text_to_file(text)
+    try:
+        return 0 if serve_qr([path], conf) else 1
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
